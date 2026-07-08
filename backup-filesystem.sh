@@ -1,23 +1,69 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-export RSYNC_PASSWORD="PASSWORD"
+##########################################################################
+# Load Environment
+##########################################################################
 
-LOG_DIR="/var/log/backup"
-LOG_FILE="$LOG_DIR/rsync-fullbackup-$(date +%Y%m%d).log"
-LOCK_FILE="/var/lock/rsync-fullbackup.lock"
-MARKER_FILE="/root/.backup-marker"
+ENV_FILE="$PWD/backup-filesystem.env"
 
-exec 9>"$LOCK_FILE"
+METRIC_HOST="${METRIC_HOST:-$(hostname -f)}"
+BACKUP_TYPE="${BACKUP_TYPE:-filesystem}"
+BACKUP_SCHEDULE="${BACKUP_SCHEDULE:-3x_week}"
+
+start_time=$(date +%s)
+
+backup_result=0
+backup_exit_code=0
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "ERROR: $ENV_FILE not found."
+    exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+##########################################################################
+# Validate Configuration
+##########################################################################
+
+: "${RSYNC_PASSWORD:?RSYNC_PASSWORD is required}"
+: "${BACKUP_HOST_MEDAN:?BACKUP_HOST_MEDAN is required}"
+: "${BACKUP_HOST_JAKARTA:?BACKUP_HOST_JAKARTA is required}"
+
+BACKUP_USER="${BACKUP_USER:-$(hostname -f)}"
+
+if [[ -z "$BACKUP_USER" ]]; then
+    BACKUP_USER="$(hostname -f)"
+fi
+
+BACKUP_TIMEOUT="${BACKUP_TIMEOUT:-300}"
+BACKUP_CONNECT_TIMEOUT="${BACKUP_CONNECT_TIMEOUT:-60}"
+BACKUP_LOCK_FILE="${BACKUP_LOCK_FILE:-/var/lock/rsync-fullbackup.lock}"
+
+##########################################################################
+# Lock
+##########################################################################
+
+mkdir -p "$(dirname "$BACKUP_LOCK_FILE")"
+
+exec 9>"$BACKUP_LOCK_FILE"
+
 flock -n 9 || {
-  echo "$(date -Is) Backup already running" | tee -a "$LOG_FILE"
-  exit 1
+    echo "$(date -Is) Backup already running."
+    exit 1
 }
 
+##########################################################################
+# Temporary Exclude File
+##########################################################################
+
 tmp=$(mktemp)
+
 trap 'rm -f "$tmp"' EXIT
 
-cat > "$tmp" << 'EOF'
+cat > "$tmp" <<'EOF'
 /dev/*
 /proc/*
 /sys/*
@@ -36,56 +82,128 @@ cat > "$tmp" << 'EOF'
 /var/lib/systemd/coredump/*
 EOF
 
-cmd_rsync() {
-  : "${rsync_host:?rsync_host is empty}"
-  : "${rsync_user:?rsync_user is empty}"
-  : "${rsync_target:?rsync_target is empty}"
 
-  echo "Backup date: $(date -Is)" > "$MARKER_FILE"
-  echo "Hostname: $(hostname -f 2>/dev/null || hostname)" >> "$MARKER_FILE"
+push_metric() {
 
-  echo "==================================================" | tee -a "$LOG_FILE"
-  echo "$(date -Is) Starting backup to rsync://$rsync_user@$rsync_host/$rsync_target" | tee -a "$LOG_FILE"
+    local ts
+    ts=$(date +%s)
 
-  rm -rf /snap-*
-  touch /snap-$(date +%Y%m%d)
-  rsync -aAXHv \
-    --numeric-ids \
-    --delete-delay \
-    --partial \
-    --timeout=300 \
-    --contimeout=60 \
-    --exclude-from="$tmp" \
-    / "rsync://$rsync_user@$rsync_host/$rsync_target" \
-    >> "$LOG_FILE" 2>&1
+    local duration
+    duration=$((ts - start_time))
 
-  rc=$?
+    local body="backup_status{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $backup_result
+backup_last_run_timestamp_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $ts
+backup_duration_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $duration
+backup_exit_code{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $backup_exit_code"
 
-  if [ "$rc" -eq 0 ]; then
-    echo "$(date -Is) Backup completed successfully" | tee -a "$LOG_FILE"
-  else
-    echo "$(date -Is) Backup failed with exit code $rc" | tee -a "$LOG_FILE"
-  fi
+    if [[ $backup_result -eq 1 ]]; then
+        body="$body
+backup_last_success_timestamp_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $ts"
+    fi
 
-  return "$rc"
+    curl -fsS \
+        -X POST \
+        "$METRICS_URL" \
+        -H "Authorization: $METRICS_AUTH" \
+        -H "Content-Type: text/plain" \
+        --data-binary "$body" \
+        >/dev/null || true
 }
+
+
+##########################################################################
+# Backup Function
+##########################################################################
+
+cmd_rsync() {
+
+    #
+    # Remove old marker
+    #
+    find / -maxdepth 1 -type f -name 'snap-*-rsync' -delete
+
+    #
+    # Create new marker
+    #
+    MARKER_FILE="/snap-$(date +%Y%m%d)-rsync"
+
+    cat > "$MARKER_FILE" <<EOF
+Backup Date : $(date -Is)
+Hostname    : $(hostname -f 2>/dev/null || hostname)
+EOF
+
+    echo "=================================================="
+    echo "Start Time  : $(date -Is)"
+    echo "Source      : /"
+    echo "Destination : rsync://$rsync_user@$rsync_host/$rsync_target"
+    echo
+
+    RSYNC_OPTS=(
+        -aAXH
+        --no-devices
+        --no-specials
+        --numeric-ids
+        --delete-delay
+        --partial
+        --timeout="$BACKUP_TIMEOUT"
+        --contimeout="$BACKUP_CONNECT_TIMEOUT"
+        --stats
+        --exclude-from="$tmp"
+    )
+
+    set +e
+
+    rsync \
+        "${RSYNC_OPTS[@]}" \
+        / \
+        "rsync://$rsync_user@$rsync_host/$rsync_target"
+
+    backup_exit_code=$?
+
+    set -e
+
+    if [[ $backup_exit_code -eq 0 ]]; then
+        backup_result=1
+        echo "$(date -Is) Backup completed successfully."
+    else
+        backup_result=0
+        echo "$(date -Is) Backup failed. Exit code: $backup_exit_code"
+    fi
+
+    push_metric
+
+    return "$backup_exit_code"
+}
+
+##########################################################################
+# Schedule
+##########################################################################
 
 weekday=$(date +%u)
 
-if [ "$weekday" = "7" ]; then
-  # Sunday: store to Medan
-  rsync_host="IP-BACKUP-MEDAN"
-  rsync_user="$(hostname -f)"
-  rsync_target="backup-$rsync_user/fs/"
-  cmd_rsync
+case "$weekday" in
 
-elif [[ "$weekday" =~ ^(2|4)$ ]]; then
-  # Tuesday and Thursday: store to Jakarta
-  rsync_host="IP-BACKUP-JAKARTA"
-  rsync_user="$(hostname -f)"
-  rsync_target="$rsync_user/filesystem/$weekday/"
-  cmd_rsync
+    7)
+        #
+        # Sunday -> Medan
+        #
+        rsync_host="$BACKUP_HOST_MEDAN"
+        rsync_user="$BACKUP_USER"
+        rsync_target="backup-$rsync_user/fs/"
+        cmd_rsync
+        ;;
 
-else
-  echo "$(date -Is) No backup schedule for weekday $weekday" | tee -a "$LOG_FILE"
-fi
+    2|4)
+        #
+        # Tuesday & Thursday -> Jakarta
+        #
+        rsync_host="$BACKUP_HOST_JAKARTA"
+        rsync_user="$BACKUP_USER"
+        rsync_target="$rsync_user/filesystem/$weekday/"
+        cmd_rsync
+        ;;
+
+    *)
+        echo "$(date -Is) No backup schedule today."
+        ;;
+esac
