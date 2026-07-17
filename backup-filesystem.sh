@@ -5,9 +5,9 @@ set -Eeuo pipefail
 # Load Environment
 ##########################################################################
 
-ENV_FILE="$PWD/backup-filesystem.env"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ENV_FILE="$SCRIPT_DIR/backup-filesystem.env"
 
-METRIC_HOST="${METRIC_HOST:-$(hostname -f)}"
 BACKUP_TYPE="${BACKUP_TYPE:-filesystem}"
 BACKUP_SCHEDULE="${BACKUP_SCHEDULE:-3x_week}"
 
@@ -31,8 +31,11 @@ source "$ENV_FILE"
 : "${RSYNC_PASSWORD:?RSYNC_PASSWORD is required}"
 : "${BACKUP_HOST_MEDAN:?BACKUP_HOST_MEDAN is required}"
 : "${BACKUP_HOST_JAKARTA:?BACKUP_HOST_JAKARTA is required}"
+: "${METRICS_URL:?METRICS_URL is required}"
+: "${METRICS_AUTH:?METRICS_AUTH is required}"
 
 BACKUP_USER="${BACKUP_USER:-$(hostname -f)}"
+METRIC_HOST="${METRIC_HOST:-$(hostname -f)}"
 
 if [[ -z "$BACKUP_USER" ]]; then
     BACKUP_USER="$(hostname -f)"
@@ -80,6 +83,13 @@ cat > "$tmp" <<'EOF'
 /var/tmp/*
 /var/log/journal/*
 /var/lib/systemd/coredump/*
+/var/lib/docker/*
+/var/lib/containerd/*
+/var/lib/containers/*
+/var/run/*
+/var/lock/*
+/swapfile
+/swap.img
 EOF
 
 
@@ -91,14 +101,14 @@ push_metric() {
     local duration
     duration=$((ts - start_time))
 
-    local body="backup_status{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $backup_result
-backup_last_run_timestamp_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $ts
-backup_duration_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $duration
-backup_exit_code{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $backup_exit_code"
+    local body="backup_status{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$metric_name\",schedule=\"$BACKUP_SCHEDULE\"} $backup_result
+backup_last_run_timestamp_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$metric_name\",schedule=\"$BACKUP_SCHEDULE\"} $ts
+backup_duration_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$metric_name\",schedule=\"$BACKUP_SCHEDULE\"} $duration
+backup_exit_code{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$metric_name\",schedule=\"$BACKUP_SCHEDULE\"} $backup_exit_code"
 
     if [[ $backup_result -eq 1 ]]; then
         body="$body
-backup_last_success_timestamp_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$rsync_target\",schedule=\"$BACKUP_SCHEDULE\"} $ts"
+backup_last_success_timestamp_seconds{host=\"$METRIC_HOST\",job=\"backup-exporter\",type=\"$BACKUP_TYPE\",name=\"$metric_name\",schedule=\"$BACKUP_SCHEDULE\"} $ts"
     fi
 
     curl -fsS \
@@ -106,7 +116,7 @@ backup_last_success_timestamp_seconds{host=\"$METRIC_HOST\",job=\"backup-exporte
         "$METRICS_URL" \
         -H "Authorization: $METRICS_AUTH" \
         -H "Content-Type: text/plain" \
-        --data-binary "$body" \
+        --data-raw "$body" \
         >/dev/null || true
 }
 
@@ -190,6 +200,7 @@ case "$weekday" in
         rsync_host="$BACKUP_HOST_MEDAN"
         rsync_user="$BACKUP_USER"
         rsync_target="backup-$rsync_user/fs/"
+        metric_name="$rsync_target"
         cmd_rsync
         ;;
 
@@ -200,6 +211,7 @@ case "$weekday" in
         rsync_host="$BACKUP_HOST_JAKARTA"
         rsync_user="$BACKUP_USER"
         rsync_target="$rsync_user/filesystem/$weekday/"
+        metric_name="$rsync_target"
         cmd_rsync
         ;;
 
